@@ -30,6 +30,57 @@ export class HardcoverSyncMapStore {
     return `${STORAGE_PREFIX}:${bookHash}:${noteId}`;
   }
 
+  private mergeRows(rows: HardcoverSyncMapRow[]): boolean {
+    let changed = false;
+    for (const row of rows) {
+      const existing = this.mappings.get(row.note_id);
+      if (!existing || row.synced_at >= existing.synced_at) {
+        this.mappings.set(row.note_id, row);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  private readLocalStorageRows(bookHash: string): HardcoverSyncMapRow[] {
+    if (!this.isWebStorageAvailable()) return [];
+
+    const rows: HardcoverSyncMapRow[] = [];
+    const prefix = `${STORAGE_PREFIX}:${bookHash}:`;
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (!key || !key.startsWith(prefix)) continue;
+
+      const raw = window.localStorage.getItem(key);
+      if (!raw) continue;
+      rows.push(JSON.parse(raw) as HardcoverSyncMapRow);
+    }
+    return rows;
+  }
+
+  private clearLocalStorageRows(bookHash: string): void {
+    if (!this.isWebStorageAvailable()) return;
+
+    const prefix = `${STORAGE_PREFIX}:${bookHash}:`;
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (key && key.startsWith(prefix)) {
+        keysToRemove.push(key);
+      }
+    }
+
+    for (const key of keysToRemove) {
+      window.localStorage.removeItem(key);
+    }
+  }
+
+  private writeLocalStorageRows(): void {
+    for (const row of this.mappings.values()) {
+      window.localStorage.setItem(this.getStorageKey(row.book_hash, row.note_id), JSON.stringify(row));
+    }
+  }
+
   private async withDb<T>(fn: (db: Awaited<ReturnType<AppService['openDatabase']>>) => Promise<T>) {
     const db = await this.appService.openDatabase(DB_SCHEMA, DB_PATH, 'Data');
     try {
@@ -39,30 +90,7 @@ export class HardcoverSyncMapStore {
     }
   }
 
-  async loadForBook(bookHash: string): Promise<void> {
-    this.loadedBookHash = bookHash;
-    this.mappings.clear();
-    this.modified = false;
-
-    if (this.isWebStorageAvailable()) {
-      try {
-        const prefix = `${STORAGE_PREFIX}:${bookHash}:`;
-        for (let i = 0; i < window.localStorage.length; i++) {
-          const key = window.localStorage.key(i);
-          if (key && key.startsWith(prefix)) {
-            const raw = window.localStorage.getItem(key);
-            if (raw) {
-              const row = JSON.parse(raw) as HardcoverSyncMapRow;
-              this.mappings.set(row.note_id, row);
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Failed to read Hardcover note mapping from localStorage:', error);
-      }
-      return;
-    }
-
+  private async loadRowsFromDb(bookHash: string): Promise<void> {
     await this.withDb(async (db) => {
       const rows = await db.select<HardcoverSyncMapRow>(
         `SELECT book_hash, note_id, hardcover_journal_id, payload_hash, synced_at
@@ -70,32 +98,12 @@ export class HardcoverSyncMapStore {
          WHERE book_hash = ?`,
         [bookHash],
       );
-      for (const row of rows) {
-        this.mappings.set(row.note_id, row);
-      }
+      this.mergeRows(rows);
     });
   }
 
-  async flush(): Promise<void> {
-    if (!this.modified || !this.loadedBookHash) return;
-
-    if (this.isWebStorageAvailable()) {
-      try {
-        for (const row of this.mappings.values()) {
-          window.localStorage.setItem(
-            this.getStorageKey(row.book_hash, row.note_id),
-            JSON.stringify(row),
-          );
-        }
-        this.modified = false;
-      } catch (error) {
-        console.error('Failed to write Hardcover note mapping to localStorage:', error);
-      }
-      return;
-    }
-
+  private async persistRowsToDb(): Promise<void> {
     await this.withDb(async (db) => {
-      // Execute inserts sequentially but within a single DB connection
       for (const row of this.mappings.values()) {
         await db.execute(
           `INSERT INTO hardcover_note_mappings
@@ -110,6 +118,57 @@ export class HardcoverSyncMapStore {
         );
       }
     });
+  }
+
+  async loadForBook(bookHash: string): Promise<void> {
+    this.loadedBookHash = bookHash;
+    this.mappings.clear();
+    this.modified = false;
+
+    if (this.isWebStorageAvailable()) {
+      try {
+        await this.loadRowsFromDb(bookHash);
+
+        const migrated = this.mergeRows(this.readLocalStorageRows(bookHash));
+        if (migrated) {
+          await this.persistRowsToDb();
+          this.clearLocalStorageRows(bookHash);
+        }
+      } catch (error) {
+        console.warn('Failed to read Hardcover note mapping from database, falling back to localStorage:', error);
+        try {
+          this.mergeRows(this.readLocalStorageRows(bookHash));
+        } catch (storageError) {
+          console.error('Failed to read Hardcover note mapping from localStorage:', storageError);
+        }
+      }
+      return;
+    }
+
+    await this.loadRowsFromDb(bookHash);
+  }
+
+  async flush(): Promise<void> {
+    if (!this.modified || !this.loadedBookHash) return;
+
+    if (this.isWebStorageAvailable()) {
+      try {
+        await this.persistRowsToDb();
+        this.clearLocalStorageRows(this.loadedBookHash);
+        this.modified = false;
+      } catch (error) {
+        console.warn('Failed to write Hardcover note mapping to database, falling back to localStorage:', error);
+        try {
+          this.writeLocalStorageRows();
+          this.modified = false;
+        } catch (storageError) {
+          console.error('Failed to write Hardcover note mapping to localStorage:', storageError);
+        }
+      }
+      return;
+    }
+
+    await this.persistRowsToDb();
     this.modified = false;
   }
 
